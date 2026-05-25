@@ -624,11 +624,13 @@ class RLPoseController(BaseController) :
             current_obs.copy_(next_obs)
 
             early_stop = self.control_interface.early_stop_triggered
+            effective_early_stop = early_stop.any() and cur_step < max_step
             if early_stop.any() :
                 metrics = self.control_interface.early_stop_metrics
                 self.logger.info(
-                    "Pose stability candidate at step {}: triggered_envs={}, delta_t={}, delta_r_deg={}, stable_count={}, mask_quality={}".format(
+                    "Pose stability candidate at step {}: effective={}, triggered_envs={}, delta_t={}, delta_r_deg={}, stable_count={}, mask_quality={}".format(
                         cur_step,
+                        effective_early_stop,
                         np.where(early_stop)[0],
                         metrics.get("delta_t"),
                         metrics.get("delta_r_deg"),
@@ -637,10 +639,13 @@ class RLPoseController(BaseController) :
                     )
                 )
 
-            if dones.any() or early_stop.all() or cur_step >= max_step:
+            if dones.any() or (early_stop.all() and cur_step < max_step) or cur_step >= max_step:
                 break
 
         estimation = self.control_interface.pred_bbox[cur_step]
 
         self.control_interface.call_manipulation(estimation, eval)
-        return
+        return {
+            "exploration_steps": cur_step * self.control_interface.num_envs,
+            "early_stop": int(cur_step < max_step and self.control_interface.early_stop_triggered.sum()),
+        }

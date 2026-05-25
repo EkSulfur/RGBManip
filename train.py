@@ -1,5 +1,6 @@
 import os
 import time
+import random
 from functools import partial
 
 import hydra
@@ -42,12 +43,26 @@ from models.pose_estimator.groundtruth_estimator import \
     GroundTruthPoseEstimator
 from utils.transform import *
 
+def set_global_seed(seed) :
+
+    if seed is None :
+        return
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available() :
+        torch.cuda.manual_seed_all(seed)
+
 def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
+
+    base_seed = task_cfg.get("seed", None)
 
     if task_cfg["name"] == "open_cabinet" :
 
         env_list = []
         for i in range(task_cfg["num_envs"]) :
+            seed = None if base_seed is None else int(base_seed) + i
             env_list.append(
                 partial(
                     OpenCabinetEnv,
@@ -56,7 +71,8 @@ def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
                     headless = headless,
                     viewerless = viewerless,
                     logger = log,
-                    renderer = 'sapien'
+                    renderer = 'sapien',
+                    seed = seed
                 )
             )
 
@@ -68,6 +84,7 @@ def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
 
         env_list = []
         for i in range(task_cfg["num_envs"]) :
+            seed = None if base_seed is None else int(base_seed) + i
             env_list.append(
                 partial(
                     OpenCabinetEnv,
@@ -76,7 +93,8 @@ def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
                     headless = headless,
                     viewerless = viewerless,
                     logger = log,
-                    renderer = 'sapien'
+                    renderer = 'sapien',
+                    seed = seed
                 )
             )
 
@@ -101,6 +119,7 @@ def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
 
         env_list = []
         for i in range(task_cfg["num_envs"]) :
+            seed = None if base_seed is None else int(base_seed) + i
             env_list.append(
                 partial(
                     OpenPotEnv,
@@ -109,7 +128,8 @@ def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
                     headless = headless,
                     viewerless = viewerless,
                     logger = log,
-                    renderer = 'sapien'
+                    renderer = 'sapien',
+                    seed = seed
                 )
             )
 
@@ -121,6 +141,7 @@ def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
 
         env_list = []
         for i in range(task_cfg["num_envs"]) :
+            seed = None if base_seed is None else int(base_seed) + i
             env_list.append(
                 partial(
                     OpenPotEnv,
@@ -129,7 +150,8 @@ def prepare_env(task_cfg, data_cfg, headless, viewerless, log) -> BaseEnv :
                     headless = headless,
                     viewerless = viewerless,
                     logger = log,
-                    renderer = 'sapien'
+                    renderer = 'sapien',
+                    seed = seed
                 )
             )
 
@@ -263,16 +285,21 @@ def test(env : MultiVecEnv, controller : BaseController, cfg : dict) :
 
     success = 0
     move_distance = 0
+    exploration_steps = 0
+    early_stop = 0
     total_num_traj = 0
     total_round = cfg["train"]["total_round"]
 
     for i in range(total_round) :
 
         logger.log.info("Test episode: %d" % i)
-        controller.run()
+        run_info = controller.run()
         obs = env.get_observation()
         move_distance += np.sum(obs["total_move_distance"])
         success += np.sum(obs["success"])
+        if isinstance(run_info, dict) :
+            exploration_steps += run_info.get("exploration_steps", 0)
+            early_stop += run_info.get("early_stop", 0)
         print(obs["success"][:, 0], obs["object_dof"][:, 0])
         total_num_traj += obs["success"].shape[0]
         env.reset()
@@ -283,6 +310,9 @@ def test(env : MultiVecEnv, controller : BaseController, cfg : dict) :
     logger.log.info("Success round: %d" % success)
     logger.log.info("Success rate: %f" % (success/total_num_traj))
     logger.log.info("Average distance: %f" % (move_distance/total_num_traj))
+    if exploration_steps > 0 :
+        logger.log.info("Average exploration steps: %f" % (exploration_steps/total_num_traj))
+        logger.log.info("Early stop episodes: %d" % early_stop)
 
 def test_baseline(env : MultiVecEnv, controller : BaselineController, cfg : dict) :
 
@@ -414,6 +444,9 @@ def my_app(cfg) :
     cfg = OmegaConf.create(cfg)
     cfg = OmegaConf.to_container(cfg, resolve=True)
     cfg_yaml = OmegaConf.to_yaml(cfg)
+    set_global_seed(cfg.get("seed", None))
+    if cfg.get("seed", None) is not None :
+        cfg["task"]["seed"] = cfg["seed"]
 
     # refresh log dir
     exp_name = cfg["exp_name"]

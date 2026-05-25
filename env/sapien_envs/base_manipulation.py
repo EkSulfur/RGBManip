@@ -1,5 +1,6 @@
 from abc import abstractclassmethod
 from typing import Union
+import random
 
 import mplib
 import numpy as np
@@ -37,8 +38,12 @@ class BaseManipulationEnv(BaseEnv):
                  viewerless=False,
                  logger=None,
                  renderer: str = "sapien",
-                 renderer_kwargs: dict = {}):
+                 renderer_kwargs: dict = {},
+                 seed=None):
         self.total_move_distance = 0
+        self.seed_value = None
+        if seed is not None :
+            self.seed(seed)
 
         super().__init__(
             headless = headless,
@@ -101,6 +106,16 @@ class BaseManipulationEnv(BaseEnv):
         # self.camera_x = self._draw_point([0,0,0], color=[0, 1, 0], size=0.015)
 
         self.reset()
+
+    def seed(self, seed=None) :
+
+        if seed is None :
+            seed = np.random.randint(0, 2**32 - 1)
+        self.seed_value = int(seed)
+        random.seed(self.seed_value)
+        np.random.seed(self.seed_value)
+
+        return self.seed_value
 
     @abstractclassmethod
     def _generate_object_config(self) :

@@ -8,13 +8,13 @@ controller:
   early_stop: 4
   pose_stability_early_stop:
     enabled: True
-    translation_threshold: 0.03
-    rotation_threshold_deg: 10.0
+    translation_threshold: 0.02
+    rotation_threshold_deg: 5.0
     mask_edge_margin: 0.03
     mask_center_margin: 0.25
-    min_views: 3
+    min_views: 4
     stable_frames: 2
-    recent_window: 2
+    recent_window: 3
   # xyz = np.clip(xyz + np.asarray([0, 0, 0.5]), [-0.4, -0.4, 0.2], [0.4, 0.4, 1.2])
 
 reward:

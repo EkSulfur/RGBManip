@@ -8,5 +8,6 @@ defaults:
   - _self_
 
 exp_name: test
+seed: null
 headless: False
 viewerless: False # no cameras activated
