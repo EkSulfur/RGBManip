@@ -9,6 +9,7 @@ from logging import Logger
 from gym.spaces import Space, Box
 from algo.ppo.ppo import PPO
 import os
+import numpy as np
 import torch
 
 class ControlInterface():
@@ -38,6 +39,11 @@ class ControlInterface():
 
         self.last_pose_target = None
         self.accumulate_steps = 0
+        self.early_stop_cfg = cfg["controller"].get("pose_stability_early_stop", {})
+        self.early_stop_enabled = self.early_stop_cfg.get("enabled", False)
+        self.early_stop_stable_count = np.zeros((self.num_envs,), dtype=np.int32)
+        self.early_stop_triggered = np.zeros((self.num_envs,), dtype=bool)
+        self.early_stop_metrics = {}
 
         self.reset_queue()
 
@@ -95,6 +101,9 @@ class ControlInterface():
         self.gt_bbox = np.zeros((self.max_steps, self.num_envs, 8, 3))
         self.available_num = np.zeros((self.num_envs,), dtype=np.int32)
         self.accumulate_steps = 0
+        self.early_stop_stable_count = np.zeros((self.num_envs,), dtype=np.int32)
+        self.early_stop_triggered = np.zeros((self.num_envs,), dtype=bool)
+        self.early_stop_metrics = {}
 
     def reset_robot(self) :
 
@@ -129,11 +138,12 @@ class ControlInterface():
 
         p_env, p_x, p_y = np.nonzero(image["camera0"]["Mask"])
         for i in range(self.num_envs) :
-            if p_env.shape[0] :
-                x_min = np.min(np.where(p_env == i, p_x, CAMERA_INTRINSIC[-1]*2))
-                x_max = np.max(np.where(p_env == i, p_x, 0))
-                y_min = np.min(np.where(p_env == i, p_y, CAMERA_INTRINSIC[-2]*2))
-                y_max = np.max(np.where(p_env == i, p_y, 0))
+            env_mask = p_env == i
+            if env_mask.any() :
+                x_min = np.min(p_x[env_mask])
+                x_max = np.max(p_x[env_mask])
+                y_min = np.min(p_y[env_mask])
+                y_max = np.max(p_y[env_mask])
                 self.available[insert_id, i] = 1
                 self.available_num[i] += 1
             else :
@@ -154,6 +164,106 @@ class ControlInterface():
         insert_id = self.accumulate_steps % self.max_steps
         self.pred_bbox[insert_id] = pred_bbox
         self.gt_bbox[insert_id] = gt_bbox
+
+    def bbox_to_pose(self, bbox) :
+
+        center = (bbox[:, 0] + bbox[:, 7]) / 2
+        direction = np.zeros((bbox.shape[0], 3, 3))
+        direction[:, :, 0] = bbox[:, 1] - bbox[:, 0]
+        direction[:, :, 1] = bbox[:, 0] - bbox[:, 2]
+        direction[:, :, 2] = bbox[:, 4] - bbox[:, 0]
+        direction = direction / (np.linalg.norm(direction, axis=1, keepdims=True) + 1e-9)
+
+        rotation = np.zeros_like(direction)
+        for env_id in range(bbox.shape[0]) :
+            if np.isfinite(direction[env_id]).all() :
+                u, _, vh = np.linalg.svd(direction[env_id])
+                rot = u @ vh
+                if np.linalg.det(rot) < 0 :
+                    u[:, -1] *= -1
+                    rot = u @ vh
+                rotation[env_id] = rot
+            else :
+                rotation[env_id] = np.eye(3)
+
+        return center, rotation
+
+    def pose_delta(self, last_bbox, cur_bbox) :
+
+        last_t, last_r = self.bbox_to_pose(last_bbox)
+        cur_t, cur_r = self.bbox_to_pose(cur_bbox)
+        delta_t = np.linalg.norm(cur_t - last_t, axis=-1)
+        trace = np.einsum("nii->n", cur_r @ np.swapaxes(last_r, -1, -2))
+        cos_angle = np.clip((trace - 1) / 2, -1.0, 1.0)
+        delta_r = np.degrees(np.arccos(cos_angle))
+
+        return delta_t, delta_r
+
+    def mask_quality(self, view_idx) :
+
+        bbox = self.bbox_queue[view_idx]
+        available = self.available[view_idx].astype(bool)
+        edge_margin = self.early_stop_cfg.get("mask_edge_margin", 0.03)
+        center_margin = self.early_stop_cfg.get("mask_center_margin", 0.25)
+        center = (bbox[:, :2] + bbox[:, 2:]) / 2
+        not_touching_edge = (
+            (bbox[:, 0] > edge_margin) &
+            (bbox[:, 1] > edge_margin) &
+            (bbox[:, 2] < 1 - edge_margin) &
+            (bbox[:, 3] < 1 - edge_margin)
+        )
+        centered = (
+            (np.abs(center[:, 0] - 0.5) < center_margin) &
+            (np.abs(center[:, 1] - 0.5) < center_margin)
+        )
+
+        return available & not_touching_edge & centered
+
+    def update_early_stop(self) :
+
+        if not self.early_stop_enabled :
+            return np.zeros((self.num_envs,), dtype=bool)
+
+        cur_idx = self.accumulate_steps % self.max_steps
+        min_views = self.early_stop_cfg.get("min_views", 3)
+        stable_required = self.early_stop_cfg.get("stable_frames", 2)
+        recent_window = self.early_stop_cfg.get("recent_window", 2)
+        trans_thresh = self.early_stop_cfg.get("translation_threshold", 0.03)
+        rot_thresh = self.early_stop_cfg.get("rotation_threshold_deg", 10.0)
+
+        if self.accumulate_steps + 1 < min_views :
+            self.early_stop_metrics = {
+                "enabled": True,
+                "stable": np.zeros((self.num_envs,), dtype=bool),
+                "reason": "not_enough_views",
+            }
+            return self.early_stop_triggered
+
+        stable = self.mask_quality(cur_idx)
+        delta_t = np.zeros((self.num_envs,))
+        delta_r = np.zeros((self.num_envs,))
+        comparisons = min(recent_window - 1, self.accumulate_steps)
+        for offset in range(comparisons) :
+            newer_idx = (self.accumulate_steps - offset) % self.max_steps
+            older_idx = (self.accumulate_steps - offset - 1) % self.max_steps
+            cur_delta_t, cur_delta_r = self.pose_delta(self.pred_bbox[older_idx], self.pred_bbox[newer_idx])
+            delta_t = np.maximum(delta_t, cur_delta_t)
+            delta_r = np.maximum(delta_r, cur_delta_r)
+            stable &= (cur_delta_t < trans_thresh) & (cur_delta_r < rot_thresh)
+
+        self.early_stop_stable_count = np.where(stable, self.early_stop_stable_count + 1, 0)
+        self.early_stop_triggered |= self.early_stop_stable_count >= stable_required
+        self.early_stop_metrics = {
+            "enabled": True,
+            "stable": stable.copy(),
+            "stable_count": self.early_stop_stable_count.copy(),
+            "triggered": self.early_stop_triggered.copy(),
+            "delta_t": delta_t.copy(),
+            "delta_r_deg": delta_r.copy(),
+            "mask_quality": self.mask_quality(cur_idx).copy(),
+        }
+
+        return self.early_stop_triggered
 
     def get_state(self) :
 
@@ -434,12 +544,18 @@ class ControlInterface():
         gt_bbox = self.env.get_observation(gt=True)["handle_bbox"]
 
         self.add_bbox(pred_bbox, gt_bbox)
+        early_stop = self.update_early_stop()
         obs = self.get_observation()
         success = np.zeros((self.num_envs,))
         if self.accumulate_steps == self.max_steps - 1 and self.cfg["reward"]["success_coef"] > 1e-9 and not eval:
             self.call_manipulation(pred_bbox, eval=True)
             success = self.env.get_observation(gt=True)["success"][:, 0]
         reward, info = self.get_reward(action, move_res, weight, success)
+        info["EARLY_STOP:triggered"] = torch.from_numpy(early_stop.astype(np.float32))
+        if self.early_stop_metrics :
+            for key, value in self.early_stop_metrics.items() :
+                if isinstance(value, np.ndarray) :
+                    info["EARLY_STOP:{}".format(key)] = torch.from_numpy(value)
 
         self.accumulate_steps += 1
 
@@ -507,7 +623,21 @@ class RLPoseController(BaseController) :
             next_obs = next_obs.to(self.controller.device)
             current_obs.copy_(next_obs)
 
-            if dones.any() or cur_step >= max_step:
+            early_stop = self.control_interface.early_stop_triggered
+            if early_stop.any() :
+                metrics = self.control_interface.early_stop_metrics
+                self.logger.info(
+                    "Pose stability candidate at step {}: triggered_envs={}, delta_t={}, delta_r_deg={}, stable_count={}, mask_quality={}".format(
+                        cur_step,
+                        np.where(early_stop)[0],
+                        metrics.get("delta_t"),
+                        metrics.get("delta_r_deg"),
+                        metrics.get("stable_count"),
+                        metrics.get("mask_quality"),
+                    )
+                )
+
+            if dones.any() or early_stop.all() or cur_step >= max_step:
                 break
 
         estimation = self.control_interface.pred_bbox[cur_step]
