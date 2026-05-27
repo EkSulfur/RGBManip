@@ -187,45 +187,11 @@ self.control_interface.call_manipulation(estimation, eval)
 
 ## 四、修改后结果比较
 
-### 1. 三任务真实参数标定结果
+只统计了Drawer一个任务下的表现
 
-本轮只标定 Cabinet / Drawer / Pot。流程为：先用 `mode=observe` 跑完整探索，再用 `scripts/calibrate_pose_stability.py` 离线模拟阈值，最后对 Cabinet / Drawer 做真实 `mode=stop` 验证。
+### Drawer 论文完整测试与 early-stop 子集统计
 
-| 任务 | 推荐策略 | 验证日志 | 成功率 | 平均探索步数 | Early-stop | 结论 |
-| --- | --- | --- | ---: | ---: | ---: | --- |
-| Cabinet | `0.015 / 10° / min_views=3 / stable_frames=1` | `outputs/2026-05-27/11-07-10/train.log` | 1.000000 | 3.400000 | 4/10 | 可启用任务级 stop |
-| Drawer | `0.030 / 12.5° / min_views=3 / stable_frames=1` | `outputs/2026-05-27/11-08-11/train.log` | 1.000000 | 3.100000 | 5/10 | 可启用任务级 stop |
-| Pot | 不启用有效 stop，保持 observe/disabled | `outputs/2026-05-27/11-01-05/train.log` | 0.800000 | 4.000000 | 0/10 actual | active 候选 risky，不建议 stop |
-
-离线标定中，Pot 的可触发候选相对完整探索最终 pose 的 `risky_trigger_rate` 为 `1.0`，因此不应为了节省视角启用真实截断。全局默认仍建议保持 `mode=observe`；实际启用时只对 Cabinet / Drawer 做任务级覆盖。
-
-### 2. Drawer 多 seed 对照结果
-
-阅读论文后，Drawer early-stop 的验证重点放在 active perception 的效率-精度权衡上：只有当 pose 已稳定且不损失成功率时，才把减少视角作为有效收益。
-
-| 参数 | Seeds | 成功率对比 | 平均探索步数 | Early-stop | 结论 |
-| --- | --- | ---: | ---: | ---: | --- |
-| `0.030 / 12.5° / min_views=3 / stable_frames=1` | 20260528-20260530 | baseline `21/30`，stop `23/30` | `4.00 -> 3.07` | 19/30 | 合计有效，但 seed 20260528 从 `0.9` 降到 `0.8`，不适合作为保守默认 |
-| `0.020 / 10° / min_views=3 / stable_frames=1` | 20260528-20260530 | baseline `21/30`，stop `27/30` | `4.00 -> 3.17` | 17/30 | 当前推荐 Drawer 任务级参数 |
-
-Drawer 当前推荐任务级覆盖：
-
-```yaml
-pose_stability_early_stop:
-  enabled: True
-  mode: stop
-  translation_threshold: 0.020
-  rotation_threshold_deg: 10.0
-  min_views: 3
-  stable_frames: 1
-  recent_window: 2
-```
-
-结论表述应保持谨慎：在当前 3 seed / 30 回合真实截断验证中，Drawer 保守参数能早停提升效率，并且未观察到成功率损失；但这不是跨所有随机初始化的严格保证。
-
-### 3. Drawer 论文式完整测试与 early-stop 子集统计
-
-按论文中 Open Drawer 测试设置，使用 `drawer_test`、`open_drawer`、`adapose_drawer`、`Drawer_0.pt` 做完整测试。论文原始方法没有 pose-stability early-stop，可作为无 early-stop 的公开基准；论文 Table I 中 Ours 在 Open Drawer 上 Test 为 `87.0%`。
+按论文中 Open Drawer 测试设置，论文 Table I 中 Ours 在 Open Drawer 上 Test 为 `87.0%`。
 
 | 设置 | 来源/日志路径 | 总轨迹 | 成功率 | 平均距离 | 平均探索步数 | Early-stop |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
@@ -300,7 +266,6 @@ python scripts/calibrate_pose_stability.py outputs/2026-05-27/11-01-05/train.log
 ### 5. 结果讨论
 
 - 本次 Pose Stability Early Stop 改进把固定 4 视角采集改为“位姿稳定后按需停止”，能减少冗余观测并缩短 active perception 阶段。
-- Cabinet / Drawer 能找到可用任务级参数，其中 Drawer 推荐保守点 `0.020 / 10° / min_views=3 / stable_frames=1`，三 seed 对照中成功率从 `21/30` 提升到 `27/30`，平均探索步数从 `4.00` 降到 `3.17`。
-- Pot 不建议启用真实截断，因为离线标定显示可触发候选风险高，强行 early-stop 可能损失后续 manipulation 成功率。
 - Drawer 100 轮完整测试中，真实截断平均探索步数为 `3.77`，但总体成功率 `85.0%` 略低于论文无 early-stop 的 `87.0%`，因此应谨慎表述为“提高效率且当前验证未发现明显退化”，不能说严格无损。
 - 改动无需重训 PPO 或 pose estimator，只在全局调度层增加稳定性判断与提前退出逻辑，便于按任务配置阈值。
+- Drawer 参数不是手工直接指定的：先在 `mode=observe` 下完整跑满 4 个视角，只记录每一步的 `delta_t`、`delta_r_deg`、mask 质量和相对最终视角的偏差；再用 `scripts/calibrate_pose_stability.py` 对 observe 日志离线扫描不同阈值，模拟每组参数会在哪一步触发 early-stop。脚本优先按 `risky_trigger_rate` 排序：若触发点相对完整 4 视角最终 pose 的 `delta_t_to_final > 0.03 m` 或 `delta_r_to_final > 10°`，就记为 risky；在风险相同的候选中，再选择节省步数更多、触发率更高的参数。最后用真实 `mode=stop` 回放验证。当前 `0.020 m / 10° / min_views=3 / stable_frames=1 / recent_window=2` 是 Drawer 上较保守的折中点，优先避免误停，再追求减少探索步数。
