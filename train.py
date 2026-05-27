@@ -287,6 +287,8 @@ def test(env : MultiVecEnv, controller : BaseController, cfg : dict) :
     move_distance = 0
     exploration_steps = 0
     early_stop = 0
+    simulated_early_stop = 0
+    observe_mode = False
     total_num_traj = 0
     total_round = cfg["train"]["total_round"]
 
@@ -295,11 +297,20 @@ def test(env : MultiVecEnv, controller : BaseController, cfg : dict) :
         logger.log.info("Test episode: %d" % i)
         run_info = controller.run()
         obs = env.get_observation()
+        logger.log.info(
+            "Test episode result: success={}, object_dof={}, total_move_distance={}".format(
+                obs["success"][:, 0],
+                obs["object_dof"][:, 0],
+                obs["total_move_distance"],
+            )
+        )
         move_distance += np.sum(obs["total_move_distance"])
         success += np.sum(obs["success"])
         if isinstance(run_info, dict) :
             exploration_steps += run_info.get("exploration_steps", 0)
             early_stop += run_info.get("early_stop", 0)
+            simulated_early_stop += run_info.get("simulated_early_stop", 0)
+            observe_mode = observe_mode or run_info.get("pose_stability_observe", False)
         print(obs["success"][:, 0], obs["object_dof"][:, 0])
         total_num_traj += obs["success"].shape[0]
         env.reset()
@@ -313,6 +324,9 @@ def test(env : MultiVecEnv, controller : BaseController, cfg : dict) :
     if exploration_steps > 0 :
         logger.log.info("Average exploration steps: %f" % (exploration_steps/total_num_traj))
         logger.log.info("Early stop episodes: %d" % early_stop)
+        if observe_mode :
+            logger.log.info("Pose stability observe mode: enabled")
+            logger.log.info("Simulated early stop episodes: %d" % simulated_early_stop)
 
 def test_baseline(env : MultiVecEnv, controller : BaselineController, cfg : dict) :
 

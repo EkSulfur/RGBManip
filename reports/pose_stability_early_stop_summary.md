@@ -335,3 +335,97 @@ Pose stability candidate at step ...
 - `Early stop episodes` 表示真正发生有效提前停止的回合数；
 - 最后一步才满足条件的 candidate 不计为有效 early-stop。
 
+## 8. 下一版流程：Observe / Dry-run 统计优先
+
+当前默认流程已改为 `mode: observe`：计算 pose stability early-stop candidate，但不真正提前停止，完整跑到最大探索步后再进入 manipulation。这样可以先统计各任务、各帧之间的 pose / mask 变化，再离线选择任务级阈值。
+
+新增日志包括：
+
+```text
+Pose stability candidate at step ...
+Pose stability frame stats step ... delta_t_to_final=... delta_r_to_final=... mask_area=...
+Pose stability observe mode: enabled
+Simulated early stop episodes: ...
+```
+
+其中 `delta_t_to_final` 和 `delta_r_to_final` 使用完整探索最后一帧 pose 作为 pseudo reference，用于判断中间帧“看似稳定”时是否已经接近最终估计。`Simulated early stop episodes` 只统计最大探索步之前触发的 candidate，最后一步 candidate 不计为收益。
+
+上线策略调整为：
+
+1. 先在各任务运行 observe 模式，完整采集多 seed、多 episode 的逐帧统计。
+2. 按任务、成功/失败 episode、触发 step 分组分析稳定性分布。
+3. 离线模拟不同阈值下的触发率、节省探索步数和潜在误停率。
+4. 只有经过统计验证的任务级参数才允许将 `mode` 从 `observe` 改为 `stop`。
+
+这比直接手工调整全局阈值更合理，也能避免 Pot 这类“容易提前触发但成功率明显下降”的任务被激进 early-stop 误伤。
+
+## 9. 三任务真实参数标定结果（2026-05-27）
+
+本轮只标定 Cabinet / Drawer / Pot。先用 `mode=observe` 跑完整探索，再用 `scripts/calibrate_pose_stability.py` 离线模拟阈值，最后对 Cabinet / Drawer 做真实 `mode=stop` 验证。
+
+| 任务 | 推荐策略 | 验证日志 | 成功率 | 平均探索步数 | Early-stop | 结论 |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| Cabinet | `0.015 / 10° / min_views=3 / stable_frames=1` | `outputs/2026-05-27/11-07-10/train.log` | 1.000000 | 3.400000 | 4/10 | 可启用任务级 stop |
+| Drawer | `0.030 / 12.5° / min_views=3 / stable_frames=1` | `outputs/2026-05-27/11-08-11/train.log` | 1.000000 | 3.100000 | 5/10 | 可启用任务级 stop |
+| Pot | 不启用有效 stop，保持 observe/disabled | `outputs/2026-05-27/11-01-05/train.log` | 0.800000 | 4.000000 | 0/10 actual | active 候选 risky，不建议 stop |
+
+离线标定中，Pot 的可触发候选相对完整探索最终 pose 的 `risky_trigger_rate` 为 `1.0`，因此不应为了节省视角启用真实截断。全局默认仍建议保持 `mode=observe`；实际启用时只对 Cabinet / Drawer 做任务级覆盖。
+
+## 10. Drawer 进一步验证（2026-05-27）
+
+阅读论文后，本轮把 Drawer early-stop 的验证重点放在 active perception 的效率-精度权衡上：只有当 pose 已稳定且不损失成功率时，才把减少视角作为有效收益。
+
+新增三 seed 真实 `mode=stop` 对照结果如下：
+
+| 参数 | Seeds | 成功率对比 | 平均探索步数 | Early-stop | 结论 |
+| --- | --- | ---: | ---: | ---: | --- |
+| `0.030 / 12.5° / min_views=3 / stable_frames=1` | 20260528-20260530 | baseline `21/30`，stop `23/30` | `4.00 -> 3.07` | 19/30 | 合计有效，但 seed 20260528 从 `0.9` 降到 `0.8`，不适合作为保守默认 |
+| `0.020 / 10° / min_views=3 / stable_frames=1` | 20260528-20260530 | baseline `21/30`，stop `27/30` | `4.00 -> 3.17` | 17/30 | 当前推荐 Drawer 任务级参数 |
+
+Drawer 当前推荐任务级覆盖：
+
+```yaml
+pose_stability_early_stop:
+  enabled: True
+  mode: stop
+  translation_threshold: 0.020
+  rotation_threshold_deg: 10.0
+  min_views: 3
+  stable_frames: 1
+  recent_window: 2
+```
+
+结论表述应保持谨慎：在当前 3 seed / 30 回合真实截断验证中，Drawer 保守参数能早停提升效率，并且未观察到成功率损失；但这不是跨所有随机初始化的严格保证。
+
+
+### 10.1 Drawer 论文式完整测试与 early-stop 子集统计
+
+按论文中 Open Drawer 测试设置，使用 `drawer_test`、`open_drawer`、`adapose_drawer`、`Drawer_0.pt` 做完整测试。论文原始方法没有 pose-stability early-stop，可作为无 early-stop 的公开基准；论文 Table I 中 Ours 在 Open Drawer 上 Train 为 `83.0%`，Test 为 `87.0%`。
+
+Drawer 无 early-stop / early-stop 对照：
+
+| 设置 | 来源/日志路径 | 总轨迹 | 成功率 | 平均距离 | 平均探索步数 | Early-stop |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 论文 Ours，无 pose-stability early-stop | `RGBManip Monocular Image-based Robotic Manipulation through Active Object Pose Estimation.pdf` Table I | - | 0.870000 | - | 4 views | 0 |
+| 本地复现，`num_envs=8` / `total_round=100` / `mode=stop` | `outputs/2026-05-27/12-03-01/train.log` | 800 | 0.868750 | 9.948265 | 4.000000 | 0/800 |
+| 本地真实截断，`num_envs=1` / `total_round=100` / `mode=stop` | `outputs/2026-05-27/13-38-43/train.log` | 100 | 0.850000 | 9.572974 | 3.770000 | 18/100 |
+
+说明：论文 Open Drawer 任务要求抽屉打开超过 `15 cm`，并以平均成功率作为主要评价指标。论文中的原始 RGBManip 流程使用固定多视角主动感知，没有本次新增的 pose-stability early-stop，因此 `87.0%` 可作为 Drawer 无 early-stop 的论文级对照。本地 `num_envs=8` 复现结果 `86.875%` 基本贴近论文 `87.0%`；但由于多环境安全策略要求所有并行 env 同时稳定才会真正截断，`num_envs=8` 下没有有效 early-stop，因此主要用于验证成功率口径。
+
+单环境 early-stop 子集统计：
+
+其中 18 条真实提前停止轨迹为：
+
+```text
+episode = [1, 4, 7, 13, 22, 27, 31, 37, 38, 42, 50, 67, 71, 75, 82, 90, 95, 99]
+```
+
+这些提前停止轨迹的成功率统计如下：
+
+| 子集 | 成功轨迹 | 总轨迹 | 成功率 | 失败 episode |
+| --- | ---: | ---: | ---: | --- |
+| 有效 early-stop 轨迹 | 15 | 18 | 0.833333 | `[38, 42, 67]` |
+| 非 early-stop 轨迹 | 70 | 82 | 0.853659 | - |
+| 全部单环境轨迹 | 85 | 100 | 0.850000 | - |
+
+结论：Drawer 单环境完整测试中，early-stop 子集成功率为 `15/18 = 83.33%`，略低于非 early-stop 子集 `70/82 = 85.37%` 和总体 `85.00%`。与论文无 early-stop 的 Open Drawer Test `87.0%` 相比，本地单环境 early-stop 总体为 `85.0%`，仍需谨慎表述：当前结果说明 Drawer 参数能减少探索步数，但不能仅凭这一组随机序列证明相对无 early-stop 严格无损。

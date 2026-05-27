@@ -8,6 +8,9 @@ controller:
   early_stop: 4
   pose_stability_early_stop:
     enabled: True
+    # observe/dry-run records candidates and frame deltas but never truncates exploration.
+    # set to stop to enable real early-stop after offline threshold calibration.
+    mode: stop
     translation_threshold: 0.025
     rotation_threshold_deg: 7.5
     mask_edge_margin: 0.03

@@ -9,6 +9,7 @@ from logging import Logger
 from gym.spaces import Space, Box
 from algo.ppo.ppo import PPO
 import os
+import json
 import numpy as np
 import torch
 
@@ -41,9 +42,12 @@ class ControlInterface():
         self.accumulate_steps = 0
         self.early_stop_cfg = cfg["controller"].get("pose_stability_early_stop", {})
         self.early_stop_enabled = self.early_stop_cfg.get("enabled", False)
+        self.early_stop_mode = self.early_stop_cfg.get("mode", "stop")
+        self.early_stop_observe = self.early_stop_mode in ["observe", "dry_run", "shadow"]
         self.early_stop_stable_count = np.zeros((self.num_envs,), dtype=np.int32)
         self.early_stop_triggered = np.zeros((self.num_envs,), dtype=bool)
         self.early_stop_metrics = {}
+        self.early_stop_records = []
 
         self.reset_queue()
 
@@ -104,6 +108,32 @@ class ControlInterface():
         self.early_stop_stable_count = np.zeros((self.num_envs,), dtype=np.int32)
         self.early_stop_triggered = np.zeros((self.num_envs,), dtype=bool)
         self.early_stop_metrics = {}
+        self.early_stop_records = []
+
+    def _jsonable(self, value) :
+
+        if isinstance(value, np.ndarray) :
+            return value.tolist()
+        if isinstance(value, np.generic) :
+            return value.item()
+        return value
+
+    def early_stop_metrics_json(self, episode_step) :
+
+        return json.dumps({
+            key: self._jsonable(value)
+            for key, value in {
+                "episode_step": episode_step,
+                **self.early_stop_metrics,
+            }.items()
+        })
+
+    def frame_stats_json(self, frame_stats) :
+
+        return json.dumps({
+            key: self._jsonable(value)
+            for key, value in frame_stats.items()
+        })
 
     def reset_robot(self) :
 
@@ -199,13 +229,16 @@ class ControlInterface():
 
         return delta_t, delta_r
 
-    def mask_quality(self, view_idx) :
+    def mask_stats(self, view_idx) :
 
         bbox = self.bbox_queue[view_idx]
         available = self.available[view_idx].astype(bool)
         edge_margin = self.early_stop_cfg.get("mask_edge_margin", 0.03)
         center_margin = self.early_stop_cfg.get("mask_center_margin", 0.25)
         center = (bbox[:, :2] + bbox[:, 2:]) / 2
+        size = np.clip(bbox[:, 2:] - bbox[:, :2], 0.0, 1.0)
+        area = size[:, 0] * size[:, 1]
+        center_offset = np.linalg.norm(center - np.array([[0.5, 0.5]]), axis=-1)
         not_touching_edge = (
             (bbox[:, 0] > edge_margin) &
             (bbox[:, 1] > edge_margin) &
@@ -216,8 +249,52 @@ class ControlInterface():
             (np.abs(center[:, 0] - 0.5) < center_margin) &
             (np.abs(center[:, 1] - 0.5) < center_margin)
         )
+        quality = available & not_touching_edge & centered
 
-        return available & not_touching_edge & centered
+        return {
+            "available": available,
+            "quality": quality,
+            "bbox": bbox.copy(),
+            "area": area,
+            "center": center,
+            "center_offset": center_offset,
+            "not_touching_edge": not_touching_edge,
+            "centered": centered,
+        }
+
+    def mask_quality(self, view_idx) :
+
+        return self.mask_stats(view_idx)["quality"]
+
+    def _record_early_stop_metrics(self, metrics) :
+
+        self.early_stop_metrics = metrics
+        record = {}
+        for key, value in metrics.items() :
+            if isinstance(value, np.ndarray) :
+                record[key] = value.copy()
+            else :
+                record[key] = value
+        self.early_stop_records.append(record)
+
+    def get_pose_stability_frame_stats(self, final_step) :
+
+        final_idx = final_step % self.max_steps
+        records = []
+        for step in range(1, final_step + 1) :
+            view_idx = step % self.max_steps
+            delta_t_to_final, delta_r_to_final = self.pose_delta(self.pred_bbox[view_idx], self.pred_bbox[final_idx])
+            mask = self.mask_stats(view_idx)
+            records.append({
+                "step": step,
+                "delta_t_to_final": delta_t_to_final,
+                "delta_r_to_final": delta_r_to_final,
+                "mask_area": mask["area"],
+                "mask_center_offset": mask["center_offset"],
+                "mask_quality": mask["quality"],
+            })
+
+        return records
 
     def update_early_stop(self) :
 
@@ -231,15 +308,24 @@ class ControlInterface():
         trans_thresh = self.early_stop_cfg.get("translation_threshold", 0.03)
         rot_thresh = self.early_stop_cfg.get("rotation_threshold_deg", 10.0)
 
+        mask = self.mask_stats(cur_idx)
         if self.accumulate_steps + 1 < min_views :
-            self.early_stop_metrics = {
+            self._record_early_stop_metrics({
                 "enabled": True,
+                "mode": self.early_stop_mode,
+                "step": self.accumulate_steps,
+                "view_count": self.accumulate_steps + 1,
                 "stable": np.zeros((self.num_envs,), dtype=bool),
+                "candidate": np.zeros((self.num_envs,), dtype=bool),
+                "triggered": self.early_stop_triggered.copy(),
                 "reason": "not_enough_views",
-            }
+                "mask_quality": mask["quality"].copy(),
+                "mask_area": mask["area"].copy(),
+                "mask_center_offset": mask["center_offset"].copy(),
+            })
             return self.early_stop_triggered
 
-        stable = self.mask_quality(cur_idx)
+        stable = mask["quality"].copy()
         delta_t = np.zeros((self.num_envs,))
         delta_r = np.zeros((self.num_envs,))
         comparisons = min(recent_window - 1, self.accumulate_steps)
@@ -252,16 +338,23 @@ class ControlInterface():
             stable &= (cur_delta_t < trans_thresh) & (cur_delta_r < rot_thresh)
 
         self.early_stop_stable_count = np.where(stable, self.early_stop_stable_count + 1, 0)
-        self.early_stop_triggered |= self.early_stop_stable_count >= stable_required
-        self.early_stop_metrics = {
+        candidate = self.early_stop_stable_count >= stable_required
+        self.early_stop_triggered |= candidate
+        self._record_early_stop_metrics({
             "enabled": True,
+            "mode": self.early_stop_mode,
+            "step": self.accumulate_steps,
+            "view_count": self.accumulate_steps + 1,
             "stable": stable.copy(),
             "stable_count": self.early_stop_stable_count.copy(),
+            "candidate": candidate.copy(),
             "triggered": self.early_stop_triggered.copy(),
             "delta_t": delta_t.copy(),
             "delta_r_deg": delta_r.copy(),
-            "mask_quality": self.mask_quality(cur_idx).copy(),
-        }
+            "mask_quality": mask["quality"].copy(),
+            "mask_area": mask["area"].copy(),
+            "mask_center_offset": mask["center_offset"].copy(),
+        })
 
         return self.early_stop_triggered
 
@@ -613,6 +706,7 @@ class RLPoseController(BaseController) :
         current_obs = current_obs.to(self.controller.device)
         weight = None
         cur_step = 0
+        simulated_early_stop_count = 0
         max_step = self.cfg["controller"]["early_stop"]
         while True :
             cur_step += 1
@@ -625,8 +719,16 @@ class RLPoseController(BaseController) :
 
             early_stop = self.control_interface.early_stop_triggered
             effective_early_stop = early_stop.any() and cur_step < max_step
+            if effective_early_stop :
+                simulated_early_stop_count = max(simulated_early_stop_count, int(early_stop.sum()))
+            metrics = self.control_interface.early_stop_metrics
+            if metrics :
+                self.logger.info(
+                    "POSE_STABILITY_STEP_JSON {}".format(
+                        self.control_interface.early_stop_metrics_json(cur_step)
+                    )
+                )
             if early_stop.any() :
-                metrics = self.control_interface.early_stop_metrics
                 self.logger.info(
                     "Pose stability candidate at step {}: effective={}, triggered_envs={}, delta_t={}, delta_r_deg={}, stable_count={}, mask_quality={}".format(
                         cur_step,
@@ -639,13 +741,41 @@ class RLPoseController(BaseController) :
                     )
                 )
 
-            if dones.any() or (early_stop.all() and cur_step < max_step) or cur_step >= max_step:
+            stop_by_pose = (
+                not self.control_interface.early_stop_observe and
+                early_stop.all() and
+                cur_step < max_step
+            )
+            if dones.any() or stop_by_pose or cur_step >= max_step:
                 break
+
+        for frame_stats in self.control_interface.get_pose_stability_frame_stats(cur_step) :
+            self.logger.info(
+                "POSE_STABILITY_FRAME_JSON {}".format(self.control_interface.frame_stats_json(frame_stats))
+            )
+            self.logger.info(
+                "Pose stability frame stats step {}: delta_t_to_final={}, delta_r_to_final={}, mask_area={}, mask_center_offset={}, mask_quality={}".format(
+                    frame_stats["step"],
+                    frame_stats["delta_t_to_final"],
+                    frame_stats["delta_r_to_final"],
+                    frame_stats["mask_area"],
+                    frame_stats["mask_center_offset"],
+                    frame_stats["mask_quality"],
+                )
+            )
 
         estimation = self.control_interface.pred_bbox[cur_step]
 
         self.control_interface.call_manipulation(estimation, eval)
+        simulated_early_stop = simulated_early_stop_count if self.control_interface.early_stop_observe else 0
+        actual_early_stop = int(
+            not self.control_interface.early_stop_observe and
+            cur_step < max_step and
+            self.control_interface.early_stop_triggered.sum()
+        )
         return {
             "exploration_steps": cur_step * self.control_interface.num_envs,
-            "early_stop": int(cur_step < max_step and self.control_interface.early_stop_triggered.sum()),
+            "early_stop": actual_early_stop,
+            "simulated_early_stop": simulated_early_stop,
+            "pose_stability_observe": self.control_interface.early_stop_observe,
         }
